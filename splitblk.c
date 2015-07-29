@@ -28,8 +28,12 @@ static int major_num = 0;
 module_param(major_num, int, 0);
 static int logical_block_size = 512;
 module_param(logical_block_size, int, 0);
-static int nsectors = 1024; /* How big the drive is */
+static int nsectors = 8192; /* How big the drive is */
 module_param(nsectors, int, 0);
+static char* key_arg = ""; /* 00:11:22:33 ... */
+module_param(key_arg, charp, 0);
+static char* backends_arg = 0x0; /* "/path/to/file_1:/path/to/file_2:/path_to_file3:..." */
+module_param(backends_arg, charp, 0);
 
 /*
  * We can tweak our hardware sector size, but the kernel talks to us
@@ -53,21 +57,66 @@ static struct sbd_device {
 } Device;
 
 /*
+ * backends-related stuff.
+ */
+
+struct sp_backend {
+  	struct file* f;
+	const char* path;
+};
+
+#define MAX_BACKENDS 64
+
+static struct sp_backend backends[MAX_BACKENDS];
+static unsigned int backends_count = 0;
+static unsigned char *key = 0x0;
+static unsigned int keylen = 0;
+
+/*
+ * the splitting algorithm
+ */
+static struct sp_backend *get_backend(unsigned long sector, unsigned long* vol_offset) {
+
+  static unsigned int sum = 0;
+
+  int tmp_offset;
+  int i;
+  int vid = 0;
+  static int *shiftvol = 0x0;
+
+  if (shiftvol == 0x0)
+    shiftvol = kmalloc(sizeof(*shiftvol) * backends_count, GFP_KERNEL);
+
+  if (sum == 0)
+    for (i = 0; i < keylen; ++i)
+      sum += key[i];
+
+  tmp_offset = sector / (sum * backends_count) * sum;
+  sector = sector % (sum * backends_count); 
+
+  for (i = 0; i < backends_count; ++i) 
+    shiftvol[i] = 0;
+
+  i = 0;
+  while (sector >= key[i]) {
+    sector -= key[i];
+    shiftvol[vid] += key[i];
+    vid = (vid + 1) % backends_count;
+    i = (i + 1) % (keylen);
+  }
+  tmp_offset += sector + shiftvol[vid];
+
+  *vol_offset = tmp_offset;
+  return backends + vid;
+}
+
+
+/*
  * Handle an I/O request.
  */
 static void sbd_transfer(struct sbd_device *dev, sector_t sector,
 		unsigned long nsect, char *buffer, int write) {
-	unsigned long offset = sector * logical_block_size;
-	unsigned long nbytes = nsect * logical_block_size;
 
-	if ((offset + nbytes) > dev->size) {
-		printk (KERN_NOTICE "sbd: Beyond-end write (%ld %ld)\n", offset, nbytes);
-		return;
-	}
-	if (write)
-		memcpy(dev->data + offset, buffer, nbytes);
-	else
-		memcpy(buffer, dev->data + offset, nbytes);
 }
 
 static void sbd_request(struct request_queue *q) {
@@ -116,15 +165,36 @@ static struct block_device_operations sbd_ops = {
 		.getgeo = sbd_getgeo
 };
 
+static int backends_init(void) {
+  unsigned i;
+  unsigned backend_index = 0;
+
+  if (backends_arg == 0x0)
+    return 1;
+
+  for (i = 0, backends[0].path = backends_arg; backends_arg[i]; ++i) {
+    if (backends_arg[i] == ':') {
+      backends_arg[i++] = 0x0;
+      backends[++backend_index].path = &backends_arg[i];
+    }
+  }
+
+  /* need at least two backends */
+  if (backend_index > 1)
+    return 1;
+
+  return 0;
+}
+
 static int __init sbd_init(void) {
 	/*
 	 * Set up our internal device.
 	 */
-	Device.size = nsectors * logical_block_size;
 	spin_lock_init(&Device.lock);
-	Device.data = vmalloc(Device.size);
-	if (Device.data == NULL)
-		return -ENOMEM;
+
+	if (backends_init())
+	  goto out;
+
 	/*
 	 * Get a request queue.
 	 */
@@ -135,7 +205,7 @@ static int __init sbd_init(void) {
 	/*
 	 * Get registered.
 	 */
-	major_num = register_blkdev(major_num, "sbd");
+	major_num = register_blkdev(major_num, "splitblk");
 	if (major_num < 0) {
 		printk(KERN_WARNING "sbd: unable to get major number\n");
 		goto out;
@@ -150,7 +220,7 @@ static int __init sbd_init(void) {
 	Device.gd->first_minor = 0;
 	Device.gd->fops = &sbd_ops;
 	Device.gd->private_data = &Device;
-	strcpy(Device.gd->disk_name, "sbd0");
+	strcpy(Device.gd->disk_name, "splitblk0");
 	set_capacity(Device.gd, nsectors);
 	Device.gd->queue = Queue;
 	add_disk(Device.gd);
@@ -158,7 +228,7 @@ static int __init sbd_init(void) {
 	return 0;
 
 out_unregister:
-	unregister_blkdev(major_num, "sbd");
+	unregister_blkdev(major_num, "splitblk");
 out:
 	vfree(Device.data);
 	return -ENOMEM;
@@ -168,7 +238,7 @@ static void __exit sbd_exit(void)
 {
 	del_gendisk(Device.gd);
 	put_disk(Device.gd);
-	unregister_blkdev(major_num, "sbd");
+	unregister_blkdev(major_num, "splitblk");
 	blk_cleanup_queue(Queue);
 	vfree(Device.data);
 }
