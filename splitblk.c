@@ -30,10 +30,10 @@ static int logical_block_size = 512;
 module_param(logical_block_size, int, 0);
 static int nsectors = 8192; /* How big the drive is */
 module_param(nsectors, int, 0);
-static char* key_arg = ""; /* 00:11:22:33 ... */
-module_param(key_arg, charp, 0);
-static char* backends_arg = 0x0; /* "/path/to/file_1:/path/to/file_2:/path_to_file3:..." */
-module_param(backends_arg, charp, 0);
+static char* key = 0x0; /* 00:11:22:33 ... */
+module_param(key, charp, 0);
+static char* backends = 0x0; /* "/path/to/file_1:/path/to/file_2:/path_to_file3:..." */
+module_param(backends, charp, 0);
 
 /*
  * We can tweak our hardware sector size, but the kernel talks to us
@@ -49,7 +49,7 @@ static struct request_queue *Queue;
 /*
  * The internal representation of our device.
  */
-static struct sbd_device {
+static struct splitblk_device {
 	unsigned long size;
 	spinlock_t lock;
 	u8 *data;
@@ -60,22 +60,22 @@ static struct sbd_device {
  * backends-related stuff.
  */
 
-struct sp_backend {
+struct splitblk_backend {
   	struct file* f;
 	const char* path;
 };
 
 #define MAX_BACKENDS 64
 
-static struct sp_backend backends[MAX_BACKENDS];
+static struct splitblk_backend backends_list[MAX_BACKENDS];
 static unsigned int backends_count = 0;
-static unsigned char *key = 0x0;
+static long sp_key[MAX_BACKENDS];
 static unsigned int keylen = 0;
 
 /*
  * the splitting algorithm
  */
-static struct sp_backend *get_backend(unsigned long sector, unsigned long* vol_offset) {
+static struct splitblk_backend *get_backend(unsigned long sector, unsigned long* vol_offset) {
 
   static unsigned int sum = 0;
 
@@ -89,7 +89,7 @@ static struct sp_backend *get_backend(unsigned long sector, unsigned long* vol_o
 
   if (sum == 0)
     for (i = 0; i < keylen; ++i)
-      sum += key[i];
+      sum += sp_key[i];
 
   tmp_offset = sector / (sum * backends_count) * sum;
   sector = sector % (sum * backends_count); 
@@ -107,19 +107,28 @@ static struct sp_backend *get_backend(unsigned long sector, unsigned long* vol_o
   tmp_offset += sector + shiftvol[vid];
 
   *vol_offset = tmp_offset;
-  return backends + vid;
+  return backends_list + vid;
 }
 
 
 /*
  * Handle an I/O request.
  */
-static void sbd_transfer(struct sbd_device *dev, sector_t sector,
+static void splitblk_transfer(struct splitblk_device *dev, sector_t sector,
 		unsigned long nsect, char *buffer, int write) {
+  sector_t s;
+  unsigned int i;
+  struct splitblk_backend *backend;
+  unsigned long offset;
 
+  for (s = sector, i = 0; i < nsect; i++, s++)
+  {
+    backend = get_backend(s, &offset);
+    printk( KERN_DEBUG "sector: %u, got backend %s offset %lu\n", s, backend->path, offset);
+  }
 }
 
-static void sbd_request(struct request_queue *q) {
+static void splitblk_request(struct request_queue *q) {
 	struct request *req;
 
 	req = blk_fetch_request(q);
@@ -132,7 +141,7 @@ static void sbd_request(struct request_queue *q) {
 			__blk_end_request_all(req, -EIO);
 			continue;
 		}
-		sbd_transfer(&Device, blk_rq_pos(req), blk_rq_cur_sectors(req),
+		splitblk_transfer(&Device, blk_rq_pos(req), blk_rq_cur_sectors(req),
 				bio_data(req->bio), rq_data_dir(req));
 		if ( ! __blk_end_request_cur(req, 0) ) {
 			req = blk_fetch_request(q);
@@ -145,7 +154,7 @@ static void sbd_request(struct request_queue *q) {
  * calls this. We need to implement getgeo, since we can't
  * use tools such as fdisk to partition the drive otherwise.
  */
-int sbd_getgeo(struct block_device * block_device, struct hd_geometry * geo) {
+int splitblk_getgeo(struct block_device * block_device, struct hd_geometry * geo) {
 	long size;
 
 	/* We have no real geometry, of course, so make something up. */
@@ -160,45 +169,103 @@ int sbd_getgeo(struct block_device * block_device, struct hd_geometry * geo) {
 /*
  * The device operations structure.
  */
-static struct block_device_operations sbd_ops = {
+static struct block_device_operations splitblk_ops = {
 		.owner  = THIS_MODULE,
-		.getgeo = sbd_getgeo
+		.getgeo = splitblk_getgeo
 };
 
-static int backends_init(void) {
-  unsigned i;
-  unsigned backend_index = 0;
+static int splitblk_backends_init(void) {
+  unsigned i, end;
+  char *p;
 
-  if (backends_arg == 0x0)
+  if (backends == 0x0)
+  {
+    printk(KERN_WARNING "sbd: missing backends\n");
     return 1;
+  }
 
-  for (i = 0, backends[0].path = backends_arg; backends_arg[i]; ++i) {
-    if (backends_arg[i] == ':') {
-      backends_arg[i++] = 0x0;
-      backends[++backend_index].path = &backends_arg[i];
+  for (p = backends, end = 0, i = 0, backends_count = 0, backends_list[0].path = backends; end == 0; ++i) {
+    if (backends[i] == ':' || backends[i] == 0x0) {
+      if (backends[i] == 0x0)
+	end = 1;
+      else
+        backends[i] = 0x0;
+      backends_list[backends_count++].path = p;
+      p = backends + i + 1;
     }
   }
 
   /* need at least two backends */
-  if (backend_index > 1)
+  if (backends_count <= 1)
     return 1;
+
+  /* open the files */
+
 
   return 0;
 }
 
-static int __init sbd_init(void) {
+static int splitblk_key_init(void) {
+  unsigned i;
+  int end;
+  char *p;
+
+  if (key == 0x0)
+  {
+    printk(KERN_WARNING "sbd: missing key\n");
+    return 1;
+  }
+
+  i = 0;
+  p = key;
+  keylen = 0;
+  end = 0;
+  do {
+    if (key[i] != ':' && key[i] != '\0') {
+      i++;
+      continue;
+    }
+    if (key[i] == 0x0)
+      end = 1;
+    if (key[i] == ':') {
+      key[i] = '\0';
+    }
+    if (kstrtol(p, 16, &sp_key[keylen])) {
+      printk(KERN_WARNING "splitblk: kstrtol failed\n");
+      return 1;
+    }
+    keylen++;
+    i++;
+    p = &key[i]; /* for the next iteration */
+    if (end)
+      break;
+  } while (1);
+
+  if (keylen >= 1)
+    return 0;
+
+  return 1;
+}
+
+static int __init splitblk_init(void) {
+        unsigned i;
 	/*
 	 * Set up our internal device.
 	 */
 	spin_lock_init(&Device.lock);
 
-	if (backends_init())
+	if (splitblk_backends_init() || splitblk_key_init())
 	  goto out;
+
+	printk(KERN_DEBUG "initialized with %u backends\n", backends_count);
+
+	for (i = 0; i < keylen; ++i)
+	  printk(KERN_DEBUG "sp_key[%i] = 0x%x\n", i, sp_key[i]);
 
 	/*
 	 * Get a request queue.
 	 */
-	Queue = blk_init_queue(sbd_request, &Device.lock);
+	Queue = blk_init_queue(splitblk_request, &Device.lock);
 	if (Queue == NULL)
 		goto out;
 	blk_queue_logical_block_size(Queue, logical_block_size);
@@ -218,7 +285,7 @@ static int __init sbd_init(void) {
 		goto out_unregister;
 	Device.gd->major = major_num;
 	Device.gd->first_minor = 0;
-	Device.gd->fops = &sbd_ops;
+	Device.gd->fops = &splitblk_ops;
 	Device.gd->private_data = &Device;
 	strcpy(Device.gd->disk_name, "splitblk0");
 	set_capacity(Device.gd, nsectors);
@@ -234,7 +301,7 @@ out:
 	return -ENOMEM;
 }
 
-static void __exit sbd_exit(void)
+static void __exit splitblk_exit(void)
 {
 	del_gendisk(Device.gd);
 	put_disk(Device.gd);
@@ -243,5 +310,5 @@ static void __exit sbd_exit(void)
 	vfree(Device.data);
 }
 
-module_init(sbd_init);
-module_exit(sbd_exit);
+module_init(splitblk_init);
+module_exit(splitblk_exit);
